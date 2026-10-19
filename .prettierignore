@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+prisma/migrations/
+package-lock.json
+
+# Spec is the source of truth — never reformat it.
+context.md

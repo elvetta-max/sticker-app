@@ -1,0 +1,183 @@
+// api-stiker database schema — source of truth: context.md §3 (corrected),
+// extended with NotificationLog (Phase 3) and AdminApp (per-admin tenant access).
+
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model App {
+  id                          String   @id @default(uuid())
+  name                        String
+  package_name                String   @unique
+  target_version              Int      @default(1)
+  force_update                Boolean  @default(false)
+  maintenance_mode            Boolean  @default(false)
+  ads_enabled                 Boolean  @default(true)
+  admob_banner                String?
+  admob_interstitial          String?
+  admob_rewarded              String?
+  admob_rewarded_interstitial String?
+  admob_openad                String?
+  admob_native                String?
+  created_at                  DateTime @default(now())
+
+  images            Image[]
+  devices           DeviceProfile[]
+  search_queries    SearchQuery[]
+  favorites         Favorite[]
+  reports           Report[]
+  notification_logs NotificationLog[]
+  admin_apps        AdminApp[]
+}
+
+model DeviceProfile {
+  device_id             String   @id
+  app_id                String
+  fcm_token             String?
+  notifications_enabled Boolean  @default(true)
+  last_active_date      DateTime @default(now())
+  streak_count          Int      @default(0)
+  last_streak_date      DateTime?
+  created_at            DateTime @default(now())
+  updated_at            DateTime @updatedAt
+
+  app App @relation(fields: [app_id], references: [id], onDelete: Cascade)
+
+  @@index([app_id])
+  @@index([app_id, last_active_date])
+}
+
+model Image {
+  id                    String   @id @default(uuid())
+  app_id                String
+  image_url             String
+  cloudinary_public_id  String
+  is_animated           Boolean  @default(false)
+  is_premium            Boolean  @default(false)
+  is_hidden             Boolean  @default(false)
+  emojis                String[]
+  downloads             Int      @default(0)
+  shares                Int      @default(0)
+  created_at            DateTime @default(now())
+  updated_at            DateTime @updatedAt
+
+  app       App        @relation(fields: [app_id], references: [id], onDelete: Cascade)
+  tags      Tag[]
+  favorites Favorite[]
+  reports   Report[]
+
+  @@index([app_id])
+  @@index([app_id, created_at])
+  @@index([app_id, downloads, shares])
+}
+
+model Tag {
+  id     String  @id @default(uuid())
+  name   String  @unique
+  images Image[]
+}
+
+model SearchQuery {
+  id         String   @id @default(uuid())
+  app_id     String
+  device_id  String
+  keyword    String
+  created_at DateTime @default(now())
+
+  app App @relation(fields: [app_id], references: [id], onDelete: Cascade)
+
+  @@index([app_id, created_at])
+}
+
+model Favorite {
+  id         String   @id @default(uuid())
+  device_id  String
+  app_id     String
+  image_id   String
+  created_at DateTime @default(now())
+
+  app   App   @relation(fields: [app_id], references: [id], onDelete: Cascade)
+  image Image @relation(fields: [image_id], references: [id], onDelete: Cascade)
+
+  @@unique([device_id, image_id])
+  @@index([app_id, device_id])
+  @@index([created_at])
+}
+
+model Report {
+  id         String   @id @default(uuid())
+  app_id     String
+  device_id  String
+  image_id   String
+  reason     String
+  status     String   @default("OPEN")
+  created_at DateTime @default(now())
+
+  app   App   @relation(fields: [app_id], references: [id], onDelete: Cascade)
+  image Image @relation(fields: [image_id], references: [id], onDelete: Cascade)
+
+  @@unique([device_id, image_id])
+  @@index([app_id, status, created_at])
+}
+
+// Phase 3: notification dispatch log. Enforces the global 1/day/device cap and
+// makes BullMQ dispatch idempotent across retries.
+model NotificationLog {
+  id         String   @id @default(uuid())
+  app_id     String
+  device_id  String
+  type       String
+  image_id   String?
+  keyword    String?
+  day        String
+  status     String   @default("SENT")
+  created_at DateTime @default(now())
+
+  app App @relation(fields: [app_id], references: [id], onDelete: Cascade)
+
+  @@unique([device_id, day])
+  @@index([app_id, type, created_at])
+}
+
+model Admin {
+  id         String     @id @default(uuid())
+  username   String     @unique
+  password   String
+  admin_apps AdminApp[]
+}
+
+// Per-admin tenant access (context.md §9).
+model AdminApp {
+  admin_id String
+  app_id   String
+
+  admin Admin @relation(fields: [admin_id], references: [id], onDelete: Cascade)
+  app   App   @relation(fields: [app_id], references: [id], onDelete: Cascade)
+
+  @@id([admin_id, app_id])
+  @@index([app_id])
+}
+
+// Append-only admin audit trail (context.md §7.8): who did what, when, to which
+// target. Deliberately has NO relation to Admin so history survives admin deletion,
+// and no update/delete code path.
+model AuditLog {
+  id             String   @id @default(uuid())
+  admin_id       String?
+  admin_username String?
+  action         String
+  target_type    String
+  target_id      String?
+  app_id         String?
+  metadata       Json?
+  created_at     DateTime @default(now())
+
+  @@index([created_at])
+  @@index([app_id, created_at])
+  @@index([admin_id, created_at])
+  @@index([action, created_at])
+}

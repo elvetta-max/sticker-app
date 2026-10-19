@@ -1,0 +1,1533 @@
+openapi: 3.0.3
+
+info:
+  title: api-stiker API
+  version: 0.1.0
+  description: |
+    Multi-tenant sticker API powering the Android client and the React admin dashboard.
+
+    ## Envelopes
+    - **Cursor list:** `{ success, data: Dto[], next_cursor }`
+    - **Single resource:** `{ success, data: <object> }`
+    - **Flattened:** `{ success, ...fields }` (app config endpoints)
+    - **Command:** `{ success, ...result }` (e.g. `job_id`, `current_downloads`)
+    - **Ops endpoints** (`/healthz`, `/readyz`, `/metrics`) do not use an envelope.
+
+    ## Errors
+    Every failure uses `{ success: false, error: { code, message, details? } }`.
+    `details` is present only for validation errors (array of `{ path, message }`) and
+    `GET /readyz` (object of dependency states).
+
+    ## Auth
+    Admin endpoints require `Authorization: Bearer <access_token>` (HS256 JWT, 15 min).
+    The refresh token is an opaque httpOnly cookie (`refresh_token`, path `/api/admin`,
+    7 days, rotated on refresh) — it is not part of any JSON body.
+
+    ## Pagination
+    List endpoints are cursor-paginated. `cursor` / `next_cursor` are opaque base64url
+    strings; pass the returned `next_cursor` to fetch the next page. `next_cursor` is
+    `null` on the last page. Limits are capped per endpoint.
+
+    ## Maintenance mode
+    When a tenant's `maintenance_mode` flag is on, every `/api/*` request returns
+    `503 MAINTENANCE_MODE` except `POST /api/auth/device` and `GET /api/apps/{app_id}/version`.
+  contact:
+    name: api-stiker
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development (port 8080)
+  - url: https://api.example.com
+    description: Production
+
+tags:
+  - name: Stickers
+    description: Public sticker feed, deep link, daily sticker, engagement and reporting.
+  - name: Device
+    description: Device registration, daily activity throttle and streaks.
+  - name: Search
+    description: Search logging, trending keywords and autocomplete.
+  - name: Favorites
+    description: Offline favorites synchronization.
+  - name: Apps
+    description: Tenant ad configuration and version policy.
+  - name: Admin Auth
+    description: Admin login, refresh and identity.
+  - name: Admin Stickers
+    description: Admin sticker upload, bulk upload, update, delete and moderation.
+  - name: Admin Jobs
+    description: Background job status (upload, replace, bulk, delete).
+  - name: Admin Apps
+    description: Admin tenant configuration.
+  - name: Admin Notifications
+    description: FCM broadcast campaigns.
+  - name: Admin Moderation
+    description: Report review queue and triage.
+  - name: Admin Audit
+    description: Append-only admin audit trail.
+  - name: Ops
+    description: Health, readiness and metrics (outside `/api`).
+
+security: []
+
+paths:
+  /api/stickers:
+    get:
+      tags: [Stickers]
+      summary: List stickers (latest or trending)
+      description: |
+        Tenant-scoped, visible (`is_hidden = false`) sticker feed. `latest` uses keyset
+        pagination on `(created_at, id)`; `trending` paginates a worker-maintained Redis
+        sorted set by `(score, id)`. Results are cached in Redis (latest 60s, trending
+        300s snapshot).
+      operationId: listStickers
+      parameters:
+        - $ref: "#/components/parameters/AppIdQuery"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - $ref: "#/components/parameters/Cursor"
+        - name: sort_by
+          in: query
+          schema: { type: string, enum: [latest, trending], default: latest }
+        - name: search
+          in: query
+          description: Free-text search (normalized, max 64 chars).
+          schema: { type: string, maxLength: 64 }
+      responses:
+        "200":
+          description: A page of stickers.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StickerList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/stickers/daily:
+    get:
+      tags: [Stickers]
+      summary: Sticker of the Day
+      description: |
+        Deterministic, shared sticker for the current UTC day. Pre-picked by the worker at
+        00:05 UTC; on a cold cache the same deterministic pick is computed on demand.
+      operationId: getDailySticker
+      parameters:
+        - $ref: "#/components/parameters/AppIdQuery"
+      responses:
+        "200":
+          description: The daily sticker.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StickerResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/StickerNotFoundOrApp" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/stickers/{id}:
+    get:
+      tags: [Stickers]
+      summary: Get a single sticker (deep link)
+      operationId: getSticker
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - $ref: "#/components/parameters/AppIdQuery"
+      responses:
+        "200":
+          description: The sticker.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StickerResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/stickers/{id}/download:
+    post:
+      tags: [Stickers]
+      summary: Track a download
+      description: |
+        Fire-and-forget counter increment via a BullMQ job; returns the optimistic count.
+        Rate limited to 60/min per `device_id` and 300/min per IP.
+      operationId: trackDownload
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EngagementBody" }
+      responses:
+        "200":
+          description: Optimistic download counter.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, current_downloads]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  current_downloads: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/stickers/{id}/share:
+    post:
+      tags: [Stickers]
+      summary: Track a share
+      description: Same as download but increments the share counter.
+      operationId: trackShare
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EngagementBody" }
+      responses:
+        "200":
+          description: Optimistic share counter.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, current_shares]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  current_shares: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/stickers/{id}/report:
+    post:
+      tags: [Stickers]
+      summary: Report a sticker
+      description: |
+        Idempotent per `(device_id, image_id)`; the response is always generic so moderation
+        state is never leaked. Rate limited to 10/min per `device_id`.
+      operationId: reportSticker
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, reason]
+              properties:
+                device_id: { type: string, minLength: 1, maxLength: 128 }
+                reason: { $ref: "#/components/schemas/ReportReason" }
+      responses:
+        "200":
+          description: Report accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuccessOnly" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/auth/device:
+    post:
+      tags: [Device]
+      summary: Register/update a device (maintenance-exempt)
+      description: |
+        Upserts the device, applies a daily write-throttle (zero writes when the day and FCM
+        token are unchanged) and advances the daily streak. Unknown tenants are a silent
+        200 no-op.
+      operationId: registerDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, app_id]
+              properties:
+                device_id: { type: string, minLength: 1, maxLength: 128 }
+                fcm_token: { type: string, maxLength: 512 }
+                app_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Synchronized.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  message:
+                    {
+                      type: string,
+                      example: "Device profile and FCM token synchronized successfully.",
+                    }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    get:
+      tags: [Device]
+      summary: Get device streak state
+      operationId: getDevice
+      parameters:
+        - name: device_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+        - $ref: "#/components/parameters/AppIdQuery"
+      responses:
+        "200":
+          description: Streak state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceStateResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404":
+          description: No profile for that device in the tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/search:
+    post:
+      tags: [Search]
+      summary: Log a search
+      description: Normalizes the keyword (§5.2), rejects empty results, inserts the query and updates Redis trending/autocomplete sets. Rate limited to 30/min per `device_id`.
+      operationId: logSearch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, app_id, keyword]
+              properties:
+                device_id: { type: string, minLength: 1, maxLength: 128 }
+                app_id: { type: string, format: uuid }
+                keyword: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        "200":
+          description: Logged; returns the normalized keyword.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: object
+                    required: [keyword]
+                    properties:
+                      keyword: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/search/trending:
+    get:
+      tags: [Search]
+      summary: Trending keywords
+      description: Top-N keywords from the worker-rebuilt Redis ZSET (10 min). Not cursor-paginated.
+      operationId: getTrendingSearches
+      parameters:
+        - $ref: "#/components/parameters/AppIdQuery"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 30, default: 10 }
+      responses:
+        "200":
+          description: Trending keywords with rounded counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [keyword, count]
+                      properties:
+                        keyword: { type: string }
+                        count: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/search/suggest:
+    get:
+      tags: [Search]
+      summary: Autocomplete suggestions
+      description: Up to 8 full normalized keywords (empty when the normalized query is shorter than 2 chars). Rate limited to 60/min per IP.
+      operationId: suggestSearch
+      parameters:
+        - $ref: "#/components/parameters/AppIdQuery"
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 64, default: "" }
+      responses:
+        "200":
+          description: Suggestions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, suggestions]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  suggestions: { type: array, items: { type: string }, maxItems: 8 }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/user/favorites/batch:
+    post:
+      tags: [Favorites]
+      summary: Synchronize favorites (batch)
+      description: |
+        Idempotent add/remove in a single transaction. `ADD` silently drops hidden or
+        cross-tenant sticker ids. Rate limited to 60/min per `device_id`.
+      operationId: batchFavorites
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, app_id, favorite_image_ids, action]
+              properties:
+                device_id: { type: string, minLength: 1, maxLength: 128 }
+                app_id: { type: string, format: uuid }
+                favorite_image_ids:
+                  type: array
+                  maxItems: 200
+                  items: { type: string, format: uuid }
+                action: { type: string, enum: [ADD, REMOVE] }
+      responses:
+        "200":
+          description: Number of rows actually inserted/removed (0 on idempotent replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, processed_count, message]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  processed_count: { type: integer }
+                  message: { type: string, example: "Batch favorites synchronized successfully." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/user/favorites:
+    get:
+      tags: [Favorites]
+      summary: List favorites
+      description: Newest-favorite-first page of sticker DTOs; excludes hidden and cross-tenant images.
+      operationId: listFavorites
+      parameters:
+        - name: device_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+        - $ref: "#/components/parameters/AppIdQuery"
+        - $ref: "#/components/parameters/Cursor"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        "200":
+          description: A page of favorite stickers.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StickerList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/apps/{app_id}/version:
+    get:
+      tags: [Apps]
+      summary: App version policy (maintenance-exempt)
+      description: 60s Redis cache. `update_required = force_update && current_version < target_version`, computed server-side.
+      operationId: getAppVersion
+      parameters:
+        - $ref: "#/components/parameters/AppIdPath"
+        - name: current_version
+          in: query
+          description: Omitted is treated as 0 (assume outdated).
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Version policy (flattened payload).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppVersion" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/apps/{app_id}/ads:
+    get:
+      tags: [Apps]
+      summary: Ad configuration
+      description: 60s Redis cache; all six AdMob units plus the master switch.
+      operationId: getAppAds
+      parameters:
+        - $ref: "#/components/parameters/AppIdPath"
+      responses:
+        "200":
+          description: Ad configuration (flattened payload).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AppAds" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { $ref: "#/components/responses/Maintenance" }
+
+  /api/admin/login:
+    post:
+      tags: [Admin Auth]
+      summary: Admin login
+      description: |
+        bcrypt compare with a dummy-hash timing defense. Returns a 15-minute access token and
+        sets the rotating `refresh_token` httpOnly cookie. After 5 failed attempts a username
+        is locked for 15 minutes. Rate limited to 10/min per IP.
+      operationId: adminLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, minLength: 1, maxLength: 64 }
+                password: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        "200":
+          description: Authenticated.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: "refresh_token=<opaque>; HttpOnly; SameSite=Strict; Path=/api/admin; Max-Age=604800"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Invalid credentials.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/refresh:
+    post:
+      tags: [Admin Auth]
+      summary: Rotate tokens
+      description: Requires the `refresh_token` cookie (no Bearer). Rotates and re-issues both tokens.
+      operationId: adminRefresh
+      responses:
+        "200":
+          description: New token pair.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "401":
+          description: Missing/invalid/expired refresh token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/logout:
+    post:
+      tags: [Admin Auth]
+      summary: Logout
+      description: Best-effort; clears the refresh cookie and server-side hash. Never returns 401.
+      operationId: adminLogout
+      responses:
+        "200":
+          description: Logged out.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  message: { type: string, example: "Logged out." }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/me:
+    get:
+      tags: [Admin Auth]
+      summary: Current admin identity
+      operationId: adminMe
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Decoded token identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { $ref: "#/components/schemas/AdminIdentity" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/stickers:
+    post:
+      tags: [Admin Stickers]
+      summary: Upload a sticker
+      description: |
+        Accepts one image (≤5 MB, png/jpeg/webp with matching magic bytes) and enqueues the
+        Sharp→Cloudinary pipeline. Returns `202` with a job id. The tenant is not verified on
+        the request path (an unknown `app_id` fails in the worker).
+      operationId: adminCreateSticker
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image, app_id]
+              properties:
+                image:
+                  {
+                    type: string,
+                    format: binary,
+                    description: "≤5 MB; image/png, image/jpeg or image/webp",
+                  }
+                app_id: { type: string, format: uuid }
+                is_premium: { type: string, enum: ["true", "false", "1", "0", "yes", "no"] }
+                is_animated: { type: string, enum: ["true", "false", "1", "0", "yes", "no"] }
+                emojis:
+                  type: array
+                  maxItems: 20
+                  items: { type: string }
+                  description: "Repeated parts, comma-separated, or a JSON array string."
+                tags:
+                  type: array
+                  maxItems: 20
+                  items: { type: string, minLength: 1, maxLength: 40 }
+      responses:
+        "202":
+          description: Job enqueued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobAccepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/BadRequest" }
+        "415": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/stickers/bulk:
+    post:
+      tags: [Admin Stickers]
+      summary: Bulk upload stickers (ZIP)
+      description: |
+        One ZIP (≤50 MB, ≤200 image entries, ≤5 MB each, ≤100 MB total) fan-out into one child
+        job per image. Path traversal and non-image entries are rejected. Progress via
+        `GET /api/admin/jobs/{job_id}`.
+      operationId: adminBulkUpload
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [zip, app_id]
+              properties:
+                zip:
+                  {
+                    type: string,
+                    format: binary,
+                    description: "≤50 MB archive; png/jpeg/webp entries",
+                  }
+                app_id: { type: string, format: uuid }
+                is_premium: { type: string }
+                is_animated: { type: string }
+                emojis: { type: array, maxItems: 20, items: { type: string } }
+                tags:
+                  {
+                    type: array,
+                    maxItems: 20,
+                    items: { type: string, minLength: 1, maxLength: 40 },
+                  }
+      responses:
+        "202":
+          description: Bulk job enqueued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, job_id, total]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  job_id: { type: string }
+                  total: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "413": { $ref: "#/components/responses/BadRequest" }
+        "415": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/stickers/{id}:
+    put:
+      tags: [Admin Stickers]
+      summary: Update a sticker
+      description: |
+        Metadata-only updates return `200` with the updated sticker. Including a new image
+        enqueues a replace job and returns `202`. Provided `tags`/`emojis` replace the whole
+        list. Admin may edit any tenant's sticker.
+      operationId: adminUpdateSticker
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StickerUpdate" }
+          multipart/form-data:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/StickerUpdate"
+                - type: object
+                  properties:
+                    image:
+                      {
+                        type: string,
+                        format: binary,
+                        description: "Optional replacement image (≤5 MB)",
+                      }
+      responses:
+        "200":
+          description: Metadata updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StickerResponse" }
+        "202":
+          description: Replacement job enqueued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobAccepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "413": { $ref: "#/components/responses/BadRequest" }
+        "415": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [Admin Stickers]
+      summary: Hard-delete a sticker
+      description: Deletes the row (cascades favorites/reports), enqueues Cloudinary asset deletion and evicts caches.
+      operationId: adminDeleteSticker
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  message: { type: string, example: "Sticker deleted successfully." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/stickers/{id}/hide:
+    post:
+      tags: [Admin Stickers]
+      summary: Hide a sticker (soft delete)
+      operationId: adminHideSticker
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Hidden.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HiddenState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/stickers/{id}/unhide:
+    post:
+      tags: [Admin Stickers]
+      summary: Unhide a sticker
+      operationId: adminUnhideSticker
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Restored.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HiddenState" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/StickerNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/jobs/{job_id}:
+    get:
+      tags: [Admin Jobs]
+      summary: Get background job status
+      description: |
+        Reads a sticker-processing job (upload/replace/delete/bulk). For a bulk parent job the
+        per-file results are promoted to `data`.
+      operationId: adminGetJob
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        "200":
+          description: Job status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { $ref: "#/components/schemas/JobStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Job not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/apps/{app_id}/version:
+    put:
+      tags: [Admin Apps]
+      summary: Update the version policy
+      operationId: adminUpdateAppVersion
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AppIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_version, force_update]
+              properties:
+                target_version: { type: integer, minimum: 1 }
+                force_update: { type: boolean }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: object
+                    properties:
+                      app_id: { type: string, format: uuid }
+                      target_version: { type: integer }
+                      force_update: { type: boolean }
+                      maintenance_mode: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/apps/{app_id}/ads:
+    put:
+      tags: [Admin Apps]
+      summary: Update ad configuration
+      description: Partial update; `null` clears a unit. Unit ids must match `^ca-app-pub-\d+/[\w-]+$`.
+      operationId: adminUpdateAppAds
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AppIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ads_enabled: { type: boolean }
+                admob_banner: { $ref: "#/components/schemas/AdMobUnit" }
+                admob_interstitial: { $ref: "#/components/schemas/AdMobUnit" }
+                admob_rewarded: { $ref: "#/components/schemas/AdMobUnit" }
+                admob_rewarded_interstitial: { $ref: "#/components/schemas/AdMobUnit" }
+                admob_openad: { $ref: "#/components/schemas/AdMobUnit" }
+                admob_native: { $ref: "#/components/schemas/AdMobUnit" }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { $ref: "#/components/schemas/AppAds" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/apps/{app_id}/maintenance:
+    put:
+      tags: [Admin Apps]
+      summary: Toggle maintenance mode
+      description: Freezes public traffic for the tenant except the two exemptions. Evicts version/maintenance caches.
+      operationId: adminUpdateAppMaintenance
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AppIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [maintenance_mode]
+              properties:
+                maintenance_mode: { type: boolean }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: object
+                    properties:
+                      app_id: { type: string, format: uuid }
+                      maintenance_mode: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/notifications/broadcast:
+    post:
+      tags: [Admin Notifications]
+      summary: Create an FCM broadcast campaign
+      description: |
+        Resolves the audience synchronously (devices with a token and notifications enabled;
+        `INACTIVE` also requires `last_active_date <= now - 3 days`) and enqueues the send.
+        Actual FCM dispatch (batches of 500, 1/day/device cap, dead-token cleanup) runs in the
+        worker. Search-based push is event-driven and not a selectable target.
+      operationId: adminBroadcast
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [app_id, target_type, title, body]
+              properties:
+                app_id: { type: string, format: uuid }
+                target_type: { type: string, enum: [ALL, INACTIVE] }
+                title: { type: string, minLength: 1, maxLength: 120 }
+                body: { type: string, minLength: 1, maxLength: 500 }
+                data:
+                  type: object
+                  additionalProperties: { type: string }
+      responses:
+        "202":
+          description: Campaign enqueued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign_id, targeted_devices_count]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  campaign_id: { type: string, format: uuid }
+                  targeted_devices_count: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/notifications/{campaign_id}:
+    get:
+      tags: [Admin Notifications]
+      summary: Get campaign status
+      operationId: adminGetCampaign
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: campaign_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Campaign status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { $ref: "#/components/schemas/CampaignStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Campaign not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/reports:
+    get:
+      tags: [Admin Moderation]
+      summary: List the moderation queue
+      description: Tenant-scoped, newest first. Hidden images remain visible to admins.
+      operationId: adminListReports
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/AppIdQuery"
+        - name: status
+          in: query
+          schema: { type: string, enum: [OPEN, REVIEWED, DISMISSED], default: OPEN }
+        - $ref: "#/components/parameters/Cursor"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        "200":
+          description: A page of reports.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, next_cursor]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { type: array, items: { $ref: "#/components/schemas/Report" } }
+                  next_cursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/AppNotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/reports/{id}/dismiss:
+    post:
+      tags: [Admin Moderation]
+      summary: Dismiss a report
+      operationId: adminDismissReport
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Report dismissed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReportTriage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Report not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/reports/{id}/resolve:
+    post:
+      tags: [Admin Moderation]
+      summary: Resolve a report
+      operationId: adminResolveReport
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+      responses:
+        "200":
+          description: Report resolved.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReportTriage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Report not found.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/admin/audit:
+    get:
+      tags: [Admin Audit]
+      summary: Read the append-only audit trail
+      description: Newest-first list of admin mutations. Read-only; `PUT`/`DELETE` fall through to 404.
+      operationId: adminListAudit
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: app_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: action
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 64 }
+        - name: admin_id
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 64 }
+        - $ref: "#/components/parameters/Cursor"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: A page of audit entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data, next_cursor]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data: { type: array, items: { $ref: "#/components/schemas/AuditEntry" } }
+                  next_cursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /healthz:
+    get:
+      tags: [Ops]
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /readyz:
+    get:
+      tags: [Ops]
+      summary: Readiness probe
+      operationId: readyz
+      responses:
+        "200":
+          description: All dependencies reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, checks]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  checks:
+                    type: object
+                    properties:
+                      database: { type: string, enum: [up, down] }
+                      redis: { type: string, enum: [up, down] }
+        "503":
+          description: One or more dependencies are down.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /metrics:
+    get:
+      tags: [Ops]
+      summary: Prometheus metrics
+      description: Prometheus text exposition. Unauthenticated — restrict to the internal scrape network.
+      operationId: metrics
+      responses:
+        "200":
+          description: Metrics in Prometheus text format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    AppIdQuery:
+      name: app_id
+      in: query
+      required: true
+      schema: { type: string, format: uuid }
+    AppIdPath:
+      name: app_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous `next_cursor`.
+      schema: { type: string, minLength: 1, maxLength: 512 }
+
+  responses:
+    BadRequest:
+      description: Validation failed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing, malformed, invalid or expired access token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    AppNotFound:
+      description: Unknown tenant.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    StickerNotFound:
+      description: Unknown, hidden or cross-tenant sticker.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    StickerNotFoundOrApp:
+      description: Unknown tenant or no visible sticker.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Maintenance:
+      description: Tenant is in maintenance mode (only `POST /api/auth/device` and `GET /api/apps/{app_id}/version` are exempt).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - NOT_FOUND
+                - STICKER_NOT_FOUND
+                - RATE_LIMITED
+                - UNAUTHORIZED
+                - INVALID_CREDENTIALS
+                - ACCOUNT_LOCKED
+                - MAINTENANCE_MODE
+                - NOT_READY
+                - INTERNAL_ERROR
+                - FORBIDDEN
+                - CONFLICT
+            message: { type: string }
+            details:
+              nullable: true
+              description: Present only for validation errors (array of `{path, message}`) or `GET /readyz` (dependency states).
+              oneOf:
+                - type: array
+                  items:
+                    type: object
+                    properties:
+                      path: { type: string }
+                      message: { type: string }
+                - type: object
+                  additionalProperties: true
+    SuccessOnly:
+      type: object
+      required: [success]
+      properties:
+        success: { type: boolean, enum: [true] }
+    Sticker:
+      type: object
+      required:
+        [
+          id,
+          app_id,
+          image_url,
+          is_animated,
+          is_premium,
+          emojis,
+          downloads,
+          shares,
+          tags,
+          created_at,
+        ]
+      properties:
+        id: { type: string, format: uuid }
+        app_id: { type: string, format: uuid }
+        image_url: { type: string, format: uri }
+        is_animated: { type: boolean }
+        is_premium: { type: boolean }
+        emojis: { type: array, items: { type: string } }
+        downloads: { type: integer }
+        shares: { type: integer }
+        tags: { type: array, items: { type: string } }
+        created_at: { type: string, format: date-time }
+    StickerResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { $ref: "#/components/schemas/Sticker" }
+    StickerList:
+      type: object
+      required: [success, data, next_cursor]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data: { type: array, items: { $ref: "#/components/schemas/Sticker" } }
+        next_cursor: { type: string, nullable: true }
+    EngagementBody:
+      type: object
+      required: [app_id, device_id]
+      properties:
+        app_id: { type: string, format: uuid }
+        device_id: { type: string, minLength: 1, maxLength: 128 }
+    ReportReason:
+      type: string
+      enum: [inappropriate, copyright, spam, other]
+    Report:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        app_id: { type: string, format: uuid }
+        device_id: { type: string }
+        image_id: { type: string, format: uuid }
+        reason: { $ref: "#/components/schemas/ReportReason" }
+        status: { type: string, enum: [OPEN, REVIEWED, DISMISSED] }
+        created_at: { type: string, format: date-time }
+        image:
+          nullable: true
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            app_id: { type: string, format: uuid }
+            image_url: { type: string, format: uri }
+            is_hidden: { type: boolean }
+            is_premium: { type: boolean }
+    ReportTriage:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            app_id: { type: string, format: uuid }
+            image_id: { type: string, format: uuid }
+            status: { type: string, enum: [REVIEWED, DISMISSED] }
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        admin_id: { type: string, nullable: true }
+        admin_username: { type: string, nullable: true }
+        action: { type: string, example: sticker.create }
+        target_type: { type: string, enum: [sticker, job, app, report, notification] }
+        target_id: { type: string, nullable: true }
+        app_id: { type: string, nullable: true }
+        metadata: { nullable: true, type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+    DeviceStateResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data:
+          type: object
+          properties:
+            streak_count: { type: integer }
+            last_active_date: { type: string, format: date-time }
+    AdminIdentity:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+    AuthResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data:
+          type: object
+          properties:
+            access_token: { type: string }
+            token_type: { type: string, enum: [Bearer] }
+            expires_in: { type: integer, example: 900 }
+            admin: { $ref: "#/components/schemas/AdminIdentity" }
+    AppVersion:
+      type: object
+      required: [success, app_id, target_version, force_update, maintenance_mode, update_required]
+      properties:
+        success: { type: boolean, enum: [true] }
+        app_id: { type: string, format: uuid }
+        target_version: { type: integer }
+        force_update: { type: boolean }
+        maintenance_mode: { type: boolean }
+        update_required: { type: boolean }
+    AdMobUnit:
+      type: string
+      nullable: true
+      description: AdMob unit id, `^ca-app-pub-\d+/[\w-]+$`.
+    AppAds:
+      type: object
+      properties:
+        success: { type: boolean, enum: [true] }
+        app_id: { type: string, format: uuid }
+        ads_enabled: { type: boolean }
+        admob_banner: { $ref: "#/components/schemas/AdMobUnit" }
+        admob_interstitial: { $ref: "#/components/schemas/AdMobUnit" }
+        admob_rewarded: { $ref: "#/components/schemas/AdMobUnit" }
+        admob_rewarded_interstitial: { $ref: "#/components/schemas/AdMobUnit" }
+        admob_openad: { $ref: "#/components/schemas/AdMobUnit" }
+        admob_native: { $ref: "#/components/schemas/AdMobUnit" }
+    JobAccepted:
+      type: object
+      required: [success, job_id]
+      properties:
+        success: { type: boolean, enum: [true] }
+        job_id: { type: string }
+    JobStatus:
+      type: object
+      properties:
+        job_id: { type: string }
+        name: { type: string }
+        status:
+          type: string
+          description: BullMQ job state.
+          enum: [waiting, active, completed, failed, delayed, prioritized, waiting-children]
+        progress: { type: number }
+        result: { nullable: true }
+        error: { type: string, nullable: true }
+        total: { type: integer, description: Bulk parent job only. }
+        completed: { type: integer, description: Bulk parent job only. }
+        failed: { type: integer, description: Bulk parent job only. }
+        results:
+          description: Bulk parent job only.
+          type: array
+          items:
+            type: object
+            properties:
+              filename: { type: string }
+              status: { type: string, enum: [completed, failed] }
+              sticker_id: { type: string, format: uuid }
+              error: { type: string }
+    CampaignStatus:
+      type: object
+      properties:
+        campaign_id: { type: string, format: uuid }
+        status: { type: string }
+        result:
+          nullable: true
+          type: object
+          properties:
+            campaign_id: { type: string, format: uuid }
+            targeted: { type: integer }
+            eligible: { type: integer }
+            sent: { type: integer }
+            failed: { type: integer }
+            skipped_capped: { type: integer }
+            dead_tokens: { type: integer }
+        error: { type: string, nullable: true }
+    StickerUpdate:
+      type: object
+      properties:
+        is_premium: { type: boolean }
+        is_animated: { type: boolean }
+        emojis: { type: array, maxItems: 20, items: { type: string, minLength: 1 } }
+        tags: { type: array, maxItems: 20, items: { type: string, minLength: 1, maxLength: 40 } }
+    HiddenState:
+      type: object
+      required: [success, data]
+      properties:
+        success: { type: boolean, enum: [true] }
+        data:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            app_id: { type: string, format: uuid }
+            is_hidden: { type: boolean }
